@@ -57,13 +57,14 @@ class StableDiffusionSDIGuidance(BaseObject):
 
         # SDI parameters https://arxiv.org/abs/2405.15891
         enable_sdi: bool = True  # if false, sample noise randomly like in SDS
-        inversion_guidance_scale: float = -7.5
+        inversion_guidance_scale: float = 1.0
         inversion_n_steps: int = 10
         inversion_eta: float = 0.3
         t_anneal: bool = True
 
         # GNRI parameters https://arxiv.org/pdf/2312.12540
         newton_steps: int = 2
+        newton_lam: float = 0.1
         newton_eta: float = 0.1
 
     cfg: Config
@@ -413,11 +414,6 @@ class StableDiffusionSDIGuidance(BaseObject):
             for t, next_t in zip(timesteps[:-1], timesteps[1:]):
                 # print(f"t -> next_t: {t} -> {next_t}")
                 if t < 0:
-                    # print("t negative, continuing")
-                    continue
-                for newton_i in range(self.cfg.newton_steps):
-                    latents.requires_grad_()
-
                     noise_pred, _, _ = self.predict_noise(
                         latents,
                         t.repeat([B]),
@@ -426,52 +422,99 @@ class StableDiffusionSDIGuidance(BaseObject):
                         azimuth,
                         camera_distances,
                         guidance_scale=self.cfg.inversion_guidance_scale,
-                        allow_model_grad=True,
                     )
-                    inverted_latents = self.ddim_inversion_step(
-                        noise_pred, t, next_t, latents
+                    latents = self.ddim_inversion_step(noise_pred, t, next_t, latents)
+                    continue
+
+                def noise_pred(x):
+                    noise_pred, _, _ = self.predict_noise(
+                        x,
+                        t.repeat([B]),
+                        prompt_utils,
+                        elevation,
+                        azimuth,
+                        camera_distances,
+                        guidance_scale=self.cfg.inversion_guidance_scale,
                     )
+                    return noise_pred
 
-                    newton_residual = torch.linalg.vector_norm(
-                        inverted_latents.flatten() - latents.flatten(), ord=1
-                    )
+                original_latents = latents.detach().clone()
 
-                    alpha_t = self.inverse_scheduler.alphas_cumprod[next_t]
-                    mu_t = (
-                        alpha_t / self.inverse_scheduler.alphas_cumprod[t]
-                    ) * latents
-                    newton_guidance = (1 / (1 - alpha_t)) * torch.linalg.vector_norm(
-                        latents - mu_t
-                    )
+                latents = newton(
+                    init=original_latents,
+                    f=lambda x: gnri_objective(
+                        self.inverse_scheduler,
+                        t_prev=t,
+                        t=next_t,
+                        z_t_k=x,
+                        z_prev=original_latents,
+                        noise_pred_func=noise_pred,
+                        gnri_lam=0.1,
+                    ),
+                    iterations=self.cfg.newton_steps,
+                )
 
-                    newton_objective = (
-                        newton_residual + self.cfg.newton_eta * newton_guidance
-                    )
-                    newton_objective.backward()
+                # best_residual = float("inf")
+                # best_latent = None
+                # best_newton_i = None
 
-                    # replace with logging?
-                    # print(
-                    #     "\n\t".join(
-                    #         [
-                    #             "newton:",
-                    #             f"i {newton_i}",
-                    #             f"residual {newton_residual.item():.4e}",
-                    #             f"guidance {newton_guidance.item():.4e}",
-                    #         ]
-                    #     )
-                    # )
+                # for newton_i in range(self.cfg.newton_steps):
+                #     latents.requires_grad_()
 
-                    assert latents.is_leaf
-                    assert latents.grad is not None
-                    latents.data -= (
-                        (1 / latents.numel()) * (newton_objective) / latents.grad
-                    )
-                    latents.grad = None
+                #     newton_residual, newton_objective, inverted_latents = (
+                #         gnri_objective(
+                #             scheduler=self.inverse_scheduler,
+                #             t_prev=t,
+                #             t=next_t,
+                #             z_t_k=latents,
+                #             z_prev=original_latents,
+                #             noise_pred_func=noise_pred,
+                #             gnri_lam=self.cfg.newton_lam,
+                #         )
+                #     )
+                #     newton_objective.backward()
 
-                    # just to be sure...
-                    for param in self.unet.parameters():
-                        param.grad = None
+                #     # if newton_residual.item() < best_residual:
+                #     #     best_residual = newton_residual.item()
+                #     #     best_latent = inverted_latents.detach().clone()
+                #     #     best_newton_i = newton_i
 
+                #     # replace with logging?
+                #     # print(
+                #     #     "\t".join(
+                #     #         [
+                #     #             "newton:",
+                #     #             f"i {newton_i}",
+                #     #             f"residual {newton_residual.item():.4e}",
+                #     #             f"guidance {newton_guidance.item():.4e}",
+                #     #         ]
+                #     #     )
+                #     # )
+
+                #     assert latents.is_leaf
+                #     assert latents.grad is not None
+                #     latents.data -= (
+                #         (1 / latents.numel())
+                #         * (newton_objective)
+                #         / (
+                #             latents.grad
+                #             + torch.sign(latents.grad) * self.cfg.newton_eta
+                #         )
+                #     )
+                #     latents.grad = None
+
+                #     # just to be sure...
+                #     for param in self.unet.parameters():
+                #         param.grad = None
+
+                # if best_newton_i > 0:
+                #     # improved -> guess that it kept improving even though we didn't evaluate
+                #     best_latent = latents.clone().detach()
+                # else:
+                #     pass
+                # print("discarded newton latent, fallback ddim inversion")
+
+                # latents = best_latent
         latents = latents.detach()
 
         # remap the noise from t+delta_t to t
@@ -736,3 +779,78 @@ class StableDiffusionSDIGuidance(BaseObject):
                 min_step_percent=C(self.cfg.min_step_percent, epoch, global_step),
                 max_step_percent=C(self.cfg.max_step_percent, epoch, global_step),
             )
+
+
+def newton(
+    init: torch.Tensor,
+    f: callable,
+    iterations: int,
+    eta: float = 1e-6,
+):
+    x = init
+    D = x.numel()
+
+    # best = None
+
+    for i in range(iterations):
+        x = x.detach().clone().requires_grad_()
+        f_value, f_obj, _ = f(x)
+        # if best is None or best[0] < f_value.item():
+        #     best = (f_value.item(), x, i)
+
+        f_obj.backward()
+
+        x_grad = x.grad
+        # x_grad[(x_grad >= 0.0) & (x_grad < 1.0)] = 1.0
+        # x_grad[(x_grad <= 0.0) & (x_grad > -1.0)] = -1.0
+        update: torch.Tensor = (1 / D) * f_obj / (x_grad + torch.sign(x_grad) * 0.1)
+        # update: torch.Tensor = (1 / D) * f_obj / (x_grad)
+
+        x = x - update
+        x.grad = None
+
+    return x.detach()
+    # best_value, best_x, best_i = best
+
+    # return best_x.detach()
+
+
+def gnri_objective(
+    scheduler,
+    t_prev: int,
+    t: int,
+    z_t_k: torch.Tensor,
+    z_prev: torch.Tensor,
+    noise_pred_func: torch.Tensor,
+    gnri_lam: float,
+):
+    alpha_prod_t = scheduler.alphas_cumprod[t]
+    alpha_prod_t_prev = scheduler.alphas_cumprod[t_prev]
+
+    def phi(alpha):
+        return (1 / alpha - 1) ** 0.5
+
+    model_output = noise_pred_func(z_t_k)
+
+    sample_inv = (
+        torch.sqrt(alpha_prod_t / alpha_prod_t_prev) * z_prev
+        + torch.sqrt(alpha_prod_t)
+        * (phi(alpha_prod_t) - phi(alpha_prod_t_prev))
+        * model_output
+    )
+
+    f = torch.linalg.vector_norm(sample_inv - z_t_k, ord=1)
+
+    mu_t = torch.sqrt(alpha_prod_t / alpha_prod_t_prev) * z_prev
+    regularizer = (1 / (1 - alpha_prod_t)) * torch.linalg.vector_norm(
+        mu_t - z_t_k, ord=2
+    )
+
+    objective = f + gnri_lam * regularizer
+
+    # print(
+    #     f"\tf {f.item():5e}"
+    #     + f" regularizer {regularizer.item():2e}"
+    #     + f" objective {objective.item():2e}"
+    # )
+    return f, objective, sample_inv
