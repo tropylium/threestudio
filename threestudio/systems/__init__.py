@@ -10,6 +10,7 @@ from . import (
     magic123,
     prolificdreamer,
     sdi,
+    sdi_newton,
     sjc,
     textmesh,
     zero123,

@@ -196,3 +196,8 @@ wandb/
 custom/*
 
 load/tets/256_tets.npz
+
+*.gif
+*.txt
+*.png
+output_logs/

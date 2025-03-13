@@ -15,7 +15,7 @@ data:
   eval_camera_distance: 2.0
   eval_fovy_deg: 70.
 
-system_type: "sdi-system"
+system_type: "sdi-newton-system"
 system:
   geometry_type: "implicit-volume"
   geometry:
@@ -77,8 +77,9 @@ system:
     enable_sdi: true
     inversion_guidance_scale: -7.5
     inversion_n_steps: 10
-    inversion_eta: 0.0
+    inversion_eta: 0.3
     t_anneal: true
+    newton_lam: 100.0
 
   loggers:
     wandb:
