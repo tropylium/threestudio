@@ -22,13 +22,17 @@ from threestudio.utils.misc import C, cleanup, parse_version
 from threestudio.utils.ops import perpendicular_component
 from threestudio.utils.typing import *
 
-DEBUG_FILE = open(
-    Path(__file__).parent
-    / "../../.."
-    / "output_logs"
-    / f"{datetime.now().ctime()}.txt",
-    "w+",
+DEBUG_FILE_PATH = (
+    Path(__file__).parent / "../../.." / "output_logs" / f"{datetime.now().ctime()}.txt"
 )
+DEBUG_FILE = None
+
+
+def debug(*args, **kwargs):
+    global DEBUG_FILE
+    if DEBUG_FILE is None:
+        DEBUG_FILE = open(DEBUG_FILE_PATH, "w+")
+    print(*args, **kwargs, file=DEBUG_FILE, flush=True)
 
 
 @threestudio.register("stable-diffusion-sdi-newton-guidance")
@@ -75,7 +79,7 @@ class StableDiffusionSDIGuidance(BaseObject):
 
         # GNRI parameters https://arxiv.org/pdf/2312.12540
         newton_steps: int = 2
-        newton_lam: float = 0.1
+        newton_lam: float = 100
         newton_eta: float = 0.1
 
     cfg: Config
@@ -166,6 +170,8 @@ class StableDiffusionSDIGuidance(BaseObject):
             self.device
         )
         self.grad_clip_val: Optional[float] = None
+
+        self.original_cfg: StableDiffusionSDIGuidance.Config = self.cfg.copy()
 
         threestudio.info(f"Loaded Stable Diffusion!")
 
@@ -364,7 +370,6 @@ class StableDiffusionSDIGuidance(BaseObject):
         effective_n_inversion_steps = (
             self.cfg.inversion_n_steps
         )  # int((n_training_steps / invert_to_t) * self.cfg.inversion_n_steps)
-
         if self.inverse_scheduler.config.timestep_spacing == "leading":
             step_ratio = n_training_steps // effective_n_inversion_steps
             timesteps = (
@@ -384,12 +389,13 @@ class StableDiffusionSDIGuidance(BaseObject):
             raise ValueError(
                 f"{self.config.timestep_spacing} is not supported. Please make sure to choose one of 'leading' or 'trailing'."
             )
+
+        # Roll timesteps array by one to reflect reversed origin and destination semantics for each step (TODO: Ask artem about this)
+        # timesteps = np.concatenate([[int(timesteps[0] - step_ratio)], timesteps])
+        timesteps = torch.from_numpy(timesteps).to(self.device)
+
         # use only timesteps before invert_to_t
         timesteps = timesteps[timesteps < int(invert_to_t)]
-
-        # Roll timesteps array by one to reflect reversed origin and destination semantics for each step
-        timesteps = np.concatenate([[int(timesteps[0] - step_ratio)], timesteps])
-        timesteps = torch.from_numpy(timesteps).to(self.device)
 
         # Add the last step
         delta_t = int(
@@ -420,9 +426,10 @@ class StableDiffusionSDIGuidance(BaseObject):
         B = start_latents.shape[0]
 
         timesteps = self.get_inversion_timesteps(invert_to_t, B)
+        # debug("inversion timesteps", timesteps)
         # print(file=DEBUG_FILE)
         for t, next_t in zip(timesteps[:-1], timesteps[1:]):
-            # print(f"t -> next_t: {t} -> {next_t}", file=DEBUG_FILE)
+            # print(f"t -> next_t: {t} -> {next_t}", file=DEBUG_FILE, flush=True)
             if t < 0:
                 # noise_pred, _, _ = self.predict_noise(
                 #     latents,
@@ -471,7 +478,7 @@ class StableDiffusionSDIGuidance(BaseObject):
                         self.cfg.inversion_eta * torch.randn_like(latents) * variance
                     )
 
-            # print("latent norm", torch.linalg.norm(latents.flatten()), file=DEBUG_FILE)
+            # debug("latent norm", torch.linalg.norm(latents.flatten()))
 
         latents = latents.detach()
 
@@ -717,10 +724,11 @@ class StableDiffusionSDIGuidance(BaseObject):
         if self.cfg.grad_clip is not None:
             self.grad_clip_val = C(self.cfg.grad_clip, epoch, global_step)
 
+        percentage = (
+            float(global_step) / self.cfg.trainer_max_steps
+        )  # progress percentage
+
         if self.cfg.t_anneal:
-            percentage = (
-                float(global_step) / self.cfg.trainer_max_steps
-            )  # progress percentage
             if type(self.cfg.max_step_percent) not in [float, int]:
                 max_step_percent = self.cfg.max_step_percent[1]
             else:
@@ -737,6 +745,15 @@ class StableDiffusionSDIGuidance(BaseObject):
                 min_step_percent=C(self.cfg.min_step_percent, epoch, global_step),
                 max_step_percent=C(self.cfg.max_step_percent, epoch, global_step),
             )
+
+        # self.cfg.newton_lam = (1 - percentage) * self.original_cfg.newton_lam
+        # debug("new newton lam", self.cfg.newton_lam)
+
+        # self.cfg.guidance_scale = (1 - percentage) * self.original_cfg.guidance_scale
+        self.cfg.inversion_guidance_scale = (
+            1 - percentage
+        ) * self.original_cfg.inversion_guidance_scale
+        # debug("new inversion guidance scale", self.cfg.inversion_guidance_scale)
 
 
 def newton(
@@ -764,7 +781,7 @@ def newton(
 
         # GNRI failed and did worse than DDIM inversion
         if best is not None and best[0] < residual.item():
-            print("falling back to ddim inversion", file=DEBUG_FILE)
+            # print("falling back to ddim inversion", file=DEBUG_FILE)
             return fallback_latent
 
         f_obj.backward()
