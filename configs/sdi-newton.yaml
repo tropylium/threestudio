@@ -1,4 +1,4 @@
-name: "score-distillation-via-inversion" # https://arxiv.org/abs/2405.15891
+name: "score-distillation-via-newton-inversion" # https://arxiv.org/abs/2405.15891
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs"
 seed: 0
@@ -80,6 +80,9 @@ system:
     inversion_eta: 0.3
     t_anneal: true
     newton_lam: 100.0
+    newton_steps: 2
+    init_noise: false
+    init_ddim: false
 
   loggers:
     wandb:

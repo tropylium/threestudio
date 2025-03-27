@@ -26,12 +26,14 @@ DEBUG_FILE_PATH = (
     Path(__file__).parent / "../../.." / "output_logs" / f"{datetime.now().ctime()}.txt"
 )
 DEBUG_FILE = None
+DESCRIPTION = "test inversion init noise + ddim"
 
 
 def debug(*args, **kwargs):
     global DEBUG_FILE
     if DEBUG_FILE is None:
         DEBUG_FILE = open(DEBUG_FILE_PATH, "w+")
+        print(DESCRIPTION, file=DEBUG_FILE, flush=True)
     print(*args, **kwargs, file=DEBUG_FILE, flush=True)
 
 
@@ -81,6 +83,8 @@ class StableDiffusionSDIGuidance(BaseObject):
         newton_steps: int = 2
         newton_lam: float = 100
         newton_eta: float = 0.1
+        init_noise: bool = False
+        init_ddim: bool = False
 
     cfg: Config
 
@@ -360,8 +364,8 @@ class StableDiffusionSDIGuidance(BaseObject):
         )
 
         # 6. Add noise to the sample
-        variance = self.scheduler._get_variance(prev_timestep, timestep) ** (0.5)
-        prev_sample += self.cfg.inversion_eta * torch.randn_like(prev_sample) * variance
+        # variance = self.scheduler._get_variance(prev_timestep, timestep) ** (0.5)
+        # prev_sample += self.cfg.inversion_eta * torch.randn_like(prev_sample) * variance
 
         return prev_sample
 
@@ -425,58 +429,73 @@ class StableDiffusionSDIGuidance(BaseObject):
         latents = start_latents.detach().clone()
         B = start_latents.shape[0]
 
+        invert_to_t_int = int(invert_to_t.item())
+
         timesteps = self.get_inversion_timesteps(invert_to_t, B)
-        # debug("inversion timesteps", timesteps)
-        # print(file=DEBUG_FILE)
+
+        # timesteps = torch.tensor([1, invert_to_t_int], device=self.device)
+
+        # timesteps = torch.linspace(
+        #     start=1,
+        #     end=invert_to_t_int,
+        #     steps=self.cfg.inversion_n_steps + 1,
+        #     dtype=int,
+        #     device=self.device,
+        # )
+
         for t, next_t in zip(timesteps[:-1], timesteps[1:]):
-            # print(f"t -> next_t: {t} -> {next_t}", file=DEBUG_FILE, flush=True)
-            if t < 0:
-                # noise_pred, _, _ = self.predict_noise(
-                #     latents,
-                #     t.repeat([B]),
-                #     prompt_utils,
-                #     elevation,
-                #     azimuth,
-                #     camera_distances,
-                #     guidance_scale=self.cfg.inversion_guidance_scale,
-                # )
-                # latents = self.ddim_inversion_step(noise_pred, t, next_t, latents)
-                pass
-            else:
-                with torch.set_grad_enabled(True):
+            init_latents = latents.detach().clone()
 
-                    def noise_pred(x):
-                        noise_pred, _, _ = self.predict_noise(
-                            x,
-                            t.repeat([B]),
-                            prompt_utils,
-                            elevation,
-                            azimuth,
-                            camera_distances,
-                            guidance_scale=self.cfg.inversion_guidance_scale,
-                        )
-                        return noise_pred
+            if self.cfg.init_noise:
+                alpha = self.inverse_scheduler.alphas_cumprod[t]
+                alpha_t_next = self.inverse_scheduler.alphas_cumprod[next_t]
+                # print(alpha, alpha_t_next)
+                init_latents = torch.sqrt(alpha_t_next / alpha) * latents + torch.sqrt(
+                    1 - alpha_t_next / alpha
+                ) * torch.randn_like(latents, device=self.device)
 
-                    original_latents = latents.detach().clone()
+            if self.cfg.init_ddim:
+                noise_pred, _, _ = self.predict_noise(
+                    latents,
+                    t.repeat([B]),
+                    prompt_utils,
+                    elevation,
+                    azimuth,
+                    camera_distances,
+                    guidance_scale=self.cfg.inversion_guidance_scale,
+                )
+                init_latents = self.ddim_inversion_step(noise_pred, t, next_t, latents)
 
-                    latents = newton(
-                        init=original_latents,
-                        f=lambda x: gnri_objective(
-                            self.inverse_scheduler,
-                            t_prev=t,
-                            t=next_t,
-                            z_t_k=x,
-                            z_prev=original_latents,
-                            noise_pred_func=noise_pred,
-                            gnri_lam=self.cfg.newton_lam,
-                        ),
-                        iterations=self.cfg.newton_steps,
+            with torch.set_grad_enabled(True):
+
+                def noise_pred(x):
+                    noise_pred, _, _ = self.predict_noise(
+                        x,
+                        t.repeat([B]),
+                        prompt_utils,
+                        elevation,
+                        azimuth,
+                        camera_distances,
+                        guidance_scale=self.cfg.inversion_guidance_scale,
                     )
+                    return noise_pred
 
-                    variance = self.scheduler._get_variance(next_t, t) ** (0.5)
-                    latents += (
-                        self.cfg.inversion_eta * torch.randn_like(latents) * variance
-                    )
+                latents = newton(
+                    init=init_latents,
+                    f=lambda x: gnri_objective(
+                        self.inverse_scheduler,
+                        t_prev=t,
+                        t=next_t,
+                        z_t_k=x,
+                        z_prev=init_latents,
+                        noise_pred_func=noise_pred,
+                        gnri_lam=self.cfg.newton_lam,
+                    ),
+                    iterations=self.cfg.newton_steps,
+                )
+
+            variance = self.scheduler._get_variance(next_t, t) ** (0.5)
+            latents += self.cfg.inversion_eta * torch.randn_like(latents) * variance
 
             # debug("latent norm", torch.linalg.norm(latents.flatten()))
 
@@ -750,9 +769,9 @@ class StableDiffusionSDIGuidance(BaseObject):
         # debug("new newton lam", self.cfg.newton_lam)
 
         # self.cfg.guidance_scale = (1 - percentage) * self.original_cfg.guidance_scale
-        self.cfg.inversion_guidance_scale = (
-            1 - percentage
-        ) * self.original_cfg.inversion_guidance_scale
+        # self.cfg.inversion_guidance_scale = (
+        #     1 - percentage
+        # ) * self.original_cfg.inversion_guidance_scale + percentage * (-1.0)
         # debug("new inversion guidance scale", self.cfg.inversion_guidance_scale)
 
 
